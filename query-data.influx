@@ -1,0 +1,474 @@
+#!/usr/bin/env ruby
+
+# configuration hash
+$C = Hash.new
+
+require 'json/pure'
+require 'timeout'
+require 'open3'
+require 'fileutils'
+require 'socket'
+require 'uri'
+require 'net/http'
+
+$stdout.sync=true
+$stderr.sync=true
+
+class Links
+	def initialize(data)
+		@data = data
+		@link_list = Hash.new
+		graph_json = JSON.parse(data)
+		graph_nodes = Hash.new
+		# Erstmal die Namen auslesen und mit ID abspeichern
+		graph_json['batadv']['nodes'].each { | n |
+			id = graph_json['batadv']['nodes'].index(n)
+			graph_nodes[n['node_id']] = id
+			graph_nodes[id] = n['node_id']
+		}
+		@links = Hash.new
+		@links.default = 0
+		# Und jetzt die Links zählen...
+		graph_json['batadv']['links'].each { | l |
+			# Namen von source und target auflösen
+			source_id = l['source']
+			target_id = l['target']
+			source_node = graph_nodes[source_id].to_s
+			target_node = graph_nodes[target_id].to_s
+			begin
+				sl = @link_list[source_node]
+				sl = Array.new unless sl
+				sl << [target_node, 1/l['tq'], (l['vpn'] ? :vpn : :mesh)]
+				@link_list[source_node] = sl
+				if l['bidirect']
+					tl = @link_list[target_node]
+					tl = Array.new unless tl
+					tl << [source_node, 1/l['tq'], (l['vpn'] ? :vpn : :mesh)]
+					@link_list[target_node] = tl
+				end
+			rescue
+				#ignored
+			end
+			if l['vpn']
+				@links[source_node + '_vpn'] += 1
+				@links[target_node + '_vpn'] += 1
+			else
+				@links[source_node + '_mesh'] += 1
+				@links[target_node + '_mesh'] += 1
+			end
+		}
+	end
+
+	# @param [String] hostname
+	# @return [Fixnum, Fixnum] Mesh, VPN
+	def links(hostname)
+		hostname = hostname.to_s
+		[@links[hostname + '_mesh'], @links[hostname + '_vpn']]
+	end
+
+	def link_list(hostname)
+		@link_list[hostname]
+	end
+end
+
+def hash_flatten(hash, sub = '')
+	new_hash = Hash.new
+	sub = sub + '.' if sub.length > 0
+	case hash
+		when Array
+			hash.each_index { |key|
+				data = hash[key]
+				key = sub + key.to_s
+				case data
+					when Hash
+						new_hash.merge!(hash_flatten(data, key))
+					when Array
+						new_hash.merge!(hash_flatten(data, key))
+					else
+						new_hash[key] = data
+				end
+			}
+		when Hash
+			hash.each_pair { |key, data|
+				key = sub + key.to_s
+				case data
+					when Hash
+						new_hash.merge!(hash_flatten(data, key))
+					when Array
+						new_hash.merge!(hash_flatten(data, key))
+					else
+						new_hash[key] = data
+				end
+			}
+		else
+			raise Exception.new
+	end
+	new_hash
+end
+
+class Alfred
+	attr_reader :hash
+
+	def initialize(data)
+		json_hash = JSON.parse(data)
+		@hash = hash_flatten(json_hash)
+	end
+end
+
+$mapping = {
+		:online => 'stats_online',
+		:uptime => 'stats_uptime',
+		:loadavg => 'usage_loadavg',
+		:memory_usage => 'usage_memory',
+		:rootfs_usage => 'usage_rootfs',
+		:clients => 'connected_clients',
+		:mesh => 'connected_mesh',
+		:vpn => 'connected_vpn',
+		:traffic_rx_bytes => 'traffic_fastd_rx_bytes',
+		:traffic_rx_packets => 'traffic_fastd_rx_packets',
+		:traffic_tx_bytes => 'traffic_fastd_tx_bytes',
+		:traffic_tx_packets => 'traffic_fastd_tx_packets',
+		:traffic_bytes => 'traffic_batman_bytes',
+		:traffic_batman_rx_bytes => 'traffic_batman_rx_bytes',
+		:traffic_batman_forward_bytes => 'traffic_batman_forward_bytes',
+		:traffic_batman_tx_bytes => 'traffic_batman_tx_bytes',
+		:traffic_batman_mgmtrx_bytes => 'traffic_batman_mgmtrx_bytes',
+		:traffic_batman_mgmttx_bytes => 'traffic_batman_mgmttx_bytes',
+		:traffic_packets => 'traffic_batman_packets'
+}
+
+class DataNode
+	attr_reader :hostname, :autoupdater, :firmware, :hardware, :sitecode
+
+	# @param [Hash] data
+	# @param [Links] links
+	def initialize(data, links, alfred, timestamp)
+		@data = Hash.new
+		@alfred = alfred
+		# Der Hostname ist Teil eines Dateisystempfads und darf daher nur bestimmte Chars enthalten.
+		@hostname = remove_unsafe_chars(data['nodeinfo']['hostname'])
+		@groupname = nil
+		begin
+			@autoupdater = remove_unsafe_chars(data['nodeinfo']['software']['autoupdater']['branch'])
+			@autoupdater = 'Unbekannt' if @autoupdater.empty?
+		rescue
+			@autoupdater = 'Unbekannt'
+		end
+		begin
+			@firmware = remove_unsafe_chars(data['nodeinfo']['software']['firmware']['release'])
+		rescue
+			@firmware = 'Unbekannt'
+		end
+		begin
+			@hardware = remove_unsafe_chars(data['nodeinfo']['hardware']['model'])
+			@hardware = 'Unbekannt' if @hardware.length < 1
+		rescue
+			@hardware = 'Unbekannt'
+		end
+		begin
+			begin
+				@sitecode = remove_unsafe_chars(data['nodeinfo']['system']['domain_code'])
+				@sitecode["_"] = "-"
+			rescue
+			ensure
+				@sitecode = nil unless @sitecode.length > 0
+			end
+			@sitecode = remove_unsafe_chars(data['nodeinfo']['system']['site_code']) unless @sitecode
+			@sitecode = 'default' if @sitecode.length < 1
+		rescue
+			@sitecode = 'default'
+		end
+		@node_id = data['nodeinfo']['node_id']
+		p 'The following entry has no nodeinfo -> node_id:', data unless @node_id
+		@node_id = 'unknown' unless @node_id
+		data['flags']['online'] ? @data[:online] = 1 : @data[:online] = 0
+		@data[:uptime] = data['statistics']['uptime'].to_i
+		@data[:loadavg] = data['statistics']['loadavg'].to_f
+		@data[:memory_usage] = data['statistics']['memory_usage'].to_f
+		@data[:rootfs_usage] = data['statistics']['rootfs_usage'].to_f
+		@data[:clients] = data['statistics']['clients'].to_f
+		@links = links.link_list(data['nodeinfo']['node_id'])
+		@data[:mesh], @data[:vpn] = links.links(@node_id)
+		begin
+			@mac = data['nodeinfo']['network']['mac']
+			@data[:traffic_rx_bytes] = alfred[@mac.to_s + '.traffic_fastd.rx_bytes'] if alfred[@mac.to_s + '.traffic_fastd.rx_bytes']
+			@data[:traffic_rx_packets] = alfred[@mac.to_s + '.traffic_fastd.rx_packets'] if alfred[@mac.to_s + '.traffic_fastd.rx_packets']
+			@data[:traffic_tx_bytes] = alfred[@mac.to_s + '.traffic_fastd.tx_bytes'] if alfred[@mac.to_s + '.traffic_fastd.tx_bytes']
+			@data[:traffic_tx_packets] = alfred[@mac.to_s + '.traffic_fastd.tx_packets'] if alfred[@mac.to_s + '.traffic_fastd.tx_packets']
+
+			@data[:traffic_batman_rx_bytes] = data['statistics']['traffic']['rx']['bytes'].to_i
+			@data[:traffic_batman_forward_bytes] = data['statistics']['traffic']['forward']['bytes'].to_i
+			@data[:traffic_batman_tx_bytes] = data['statistics']['traffic']['tx']['bytes'].to_i
+			@data[:traffic_batman_mgmttx_bytes] = data['statistics']['traffic']['mgmt_tx']['bytes'].to_i
+			@data[:traffic_batman_mgmtrx_bytes] = data['statistics']['traffic']['mgmt_rx']['bytes'].to_i
+		rescue
+			# ignored
+		end
+		@timestamp = timestamp
+	end
+	def setGroup(groupname)
+		@groupname = groupname.to_s
+	end
+	def get_influx_lines(socket = nil)
+		out = Array.new
+		t = @timestamp.to_i.to_s
+		measurement = "nodes"
+		tags = "region=" + $C[:region]
+		tags << ",domain=" + @sitecode
+		tags << ",group=" + @groupname if @groupname
+		tags << ",nodeid=" + @node_id
+		tags << ",node=" + @hostname
+		tags << ",autoupdater=" + @autoupdater
+		tags << ",firmware=" + @firmware
+		tags << ",hardware=" + @hardware
+		fields = ""
+		comma = ""
+		@data.each_pair { | key, dp |
+			fields << comma + $mapping[key] + "=" + dp.to_s
+			comma = ","
+		}
+		line = "#{measurement},#{tags} #{fields} #{t}"
+		out << line
+		@links.each { | l |
+			if $node_map[l.first]
+				line = "links"
+				line << ",group=#{@groupname}" if @groupname
+				line << ",region=#{$C[:region]},domain=#{@sitecode},linktype=#{l[2]},sourcenodeid=#{@node_id},sourcenode=#{@hostname},targetnodeid=#{l.first},targetnode=#{$node_map[l.first]},autoupdater=#{@autoupdater},firmware=#{@firmware},hardware=#{@hardware} tq=#{l[1].to_s} #{t}"
+				out << line
+			end
+		} if @links
+		out
+	end
+end
+
+class DataGroup
+	# @param [Regexp] filter
+	# @param [Fixnum] min_size
+	def initialize(name, filter, min_size = 5)
+		@name = name
+		@data_points = Hash.new
+		@filter = Regexp.new(filter)
+		@min_size = min_size
+	end
+
+	# @param [DataNode] node
+	# @return [TrueClass|FalseClass]
+	def add_member(node)
+		raise Exception unless node.class == DataNode
+		node_name = node.hostname.to_s
+		node.setGroup(@name) if node_name.match(@filter)
+	end
+end
+
+class NodesJson
+	attr_reader :last_update
+	# @param [Hash] data
+	# @param [Links] links
+	def initialize(data, links, alfred)
+		groups = Hash.new
+		begin
+			# Gruppen einlesen
+			Dir.entries($C[:groups_dir]).each { | group_name |
+				# bestimmte Einträge ignorieren
+				next if group_name[0] == '.'
+				next if group_name == 'README.md'
+				next if group_name == 'README.txt'
+				group_lines = File.readlines($C[:groups_dir] + '/' + group_name)
+				groups[remove_unsafe_chars(group_name)] = DataGroup.new(group_name, group_lines.first.chomp)
+			} if $C[:groups_dir]
+		rescue
+			# ignored
+			# there will simply be no groups or no groups after the failing group
+		end
+		@data = JSON.parse(data)
+		last_update = @data['timestamp']
+		@last_update = Time.new(last_update[0..3], last_update[5..6], last_update[8..9], last_update[11..12],
+		                        last_update[14..15], last_update[17..18], 0)
+		@last_update.localtime
+		puts "Last update: #{@last_update.to_s} (#{(Time.now - @last_update).to_i}s ago)"
+		if($C[:interval_forced])
+			$next_update = @last_update + $C[:interval]
+		else
+			$next_update = @last_update + $C[:interval] + 10 + ($C[:interval] * Random.rand(0.3))
+		end
+		$next_update.localtime
+		@nodes = Hash.new
+		$known_nodes = Array.new
+		$node_map = Hash.new
+		@data['nodes'].each_pair { | node_id, node |
+			begin
+				$node_map[node_id] = remove_unsafe_chars(node['nodeinfo']['hostname'])
+			rescue
+				# ignored
+			end
+		}
+		post_body = Array.new
+		@data['nodes'].each_pair { | node_id, node |
+			dn = DataNode.new(node, links, alfred, @last_update)
+			@nodes[node_id] = dn
+			groups.each_value { | group |
+				# Just try to add to every group. The group will reject a node if
+				# the filter does not match.
+				group.add_member(dn)
+			}
+			post_body << dn.get_influx_lines
+		}
+		$stdout.puts(post_body.join("\n")) if $C[:debug]
+		if (!$C[:dry_run])
+			# Start the HTTP request...
+			uri = URI.parse($C[:influx_url])
+			http = Net::HTTP.new(uri.host, uri.port)
+			post = Net::HTTP::Post.new(uri.request_uri)
+			post.body = post_body.join("\n")
+			http.start
+			response = http.request(post)
+			http.finish
+			$stdout.puts("Sent #{post.body.length} bytes in #{post_body.length} lines, response #{response.code} #{response.msg}")
+		end
+	end
+end
+
+# Sollte alles entfernen, was potentiell gefährlich im Dateinamen ist...
+# @param [String] text
+# @param [String] r
+# @return [String]
+def remove_unsafe_chars(text, r = '')
+	$remove_unsafe_chars_cache = Hash.new unless $remove_unsafe_chars_cache
+	text = text.to_s
+	orig = String.new(text)
+	cache = $remove_unsafe_chars_cache[text]
+	return cache if cache
+	unsafe_chars = /[^-_0-9a-zA-Z]/
+	text[unsafe_chars] = r while text[unsafe_chars]
+	String.new($remove_unsafe_chars_cache[orig] = text)
+end
+
+# @param [String] config_file
+# @return [nil]
+def read_config(config_file)
+	conf = File.readlines(config_file)
+	comment = /^( |\t)*#/
+	options = 'alfred_json|graph_json|nodes_json|interval|interval_forced|influx_url|carbon_host|carbon_port|region|groups_dir|quiet'.split('|')
+	options_required = 'graph_json|nodes_json|interval|influx_url|region'.split('|')
+	conf.each { | line |
+		next if line.match(comment)
+		a, b = line.split('=', 2)
+		a = a.strip.chomp.to_sym
+		b = b.strip.chomp
+		# Prüfen ob der Wert ein Integer ist und ggfs. konvertieren
+		b = b.to_i if(b.to_i.to_s == b)
+		b = true if(b.to_s == "true")
+		b = true if(b.to_s == "yes")
+		b = false if(b.to_s == "false")
+		b = false if(b.to_s == "no")
+		if options.include?(a.to_s)
+			$C[a] = b
+		else
+			$stderr.puts("ERROR: Unbekannte Option: #{a}")
+			exit
+		end
+	}
+	$C.each_key { | option |
+		options_required = options_required - [option.to_s]
+	}
+	if options_required.length > 0
+		puts "ERROR: Fehlende Optionen. Die folgenden Optionen fehlen in der Konfigurationsdatei: #{options_required.join(', ')}"
+		Kernel.exit 1
+	end
+	nil
+end
+
+# @param [String] url
+# @return [String] Data read from the URL
+def download(url)
+	data = nil
+	Open3.popen2('wget', '-q', '-O', '-', '--connect-timeout=5', url) {| _, o, _ |
+		o.binmode
+		data = o.read
+	}
+	data
+end
+
+# @param [String] description
+def time(description)
+	start = Time.now
+	r = yield
+	finish = Time.now
+	diff = '%.3f' % (finish - start).to_f
+	puts "#{description} took #{diff} seconds"
+	r
+end
+
+# @return [nil]
+def main_loop
+	if($C[:interval_forced])
+		delay = ($next_update - Time.now).to_i
+		sleep(delay)
+		sleep(0.1) until Time.now > $next_update
+	else
+		sleep(Random.rand(10)) while Time.now < $next_update
+	end
+	begin
+		# Timeout at 95% of the interval
+		Timeout::timeout($C[:interval]*(0.95)) {
+			begin
+				alfred_json = time('download alfred_json') { download($C[:alfred_json]) }
+				alfred = time('parsing alfred.json') { Alfred.new(alfred_json).hash }
+			rescue
+				alfred = Hash.new
+			end
+			graph_json = time('download graph_json') { download($C[:graph_json]) }
+			links = time('calculating links') { Links.new(graph_json) }
+			nodes_json = time('download nodes_json') { download($C[:nodes_json]) }
+			time('calculating nodes_json') { NodesJson.new(nodes_json, links, alfred) }
+		}
+	rescue Timeout::Error
+		$stderr.puts 'WARNING: Timeout triggered.'
+	ensure
+		begin
+			$next_update = Time.now + $C[:interval] if $next_update <= Time.now
+		rescue
+			$next_update = Time.now + $C[:interval]
+		end
+	end
+	puts "Next update: #{$next_update.to_s} (in #{($next_update - Time.now).to_i} seconds)"
+end
+
+# Befehlszeile verarbeiten
+while (ARGV.length > 0)
+	case a = ARGV.shift
+		when '--config'
+			read_config(ARGV.shift)
+		when '--dry-run'
+			# Don't send data to influx
+			$C[:dry_run] = true
+		when '--debug'
+			# Display data that would have been sent to graphite on stderr
+			$C[:debug] = true
+		else
+			$stderr.puts("ERROR: Unbekannte Option: #{a}")
+			Kernel.exit 1
+	end
+end
+
+if ($C.length < 1)
+	$stderr.puts("ERROR: Befehl: #{$0} --config <conf>")
+	Kernel.exit 1
+end
+
+p $C
+
+$next_update = Time.now
+if $C[:debug]
+	main_loop
+else
+	if $C[:quiet]
+		begin
+			main_loop while true
+		rescue
+			Kernel.exit(1)
+		end
+	else
+		main_loop while true
+	end
+end
