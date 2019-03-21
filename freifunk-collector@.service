@@ -1,0 +1,15 @@
+[Unit]
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Restart=always
+RestartSec=60
+User=ff
+Group=ff
+Type=simple
+WorkingDirectory=/
+ExecStart=/path/to/query-data --config /path/to/config/%I.conf
+
+[Install]
+WantedBy=multi-user.target
